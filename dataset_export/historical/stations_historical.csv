@@ -1,0 +1,23 @@
+station,station_name,telemetry_id,river,country,lat,lng
+CSA,Chiang Saen,010501,Mekong,Thailand,20.27412,100.08855
+CKH,Chiang Khan,011903,Mekong,Thailand,17.90026,101.66989
+LUA,Luang Prabang,011201,Mekong,Lao PDR,19.8928,102.13418
+VIE,Vientiane KM4,011901,Mekong,Lao PDR,17.93098,102.61556
+NON,Nong Khai 2,012002,Mekong,Thailand,17.87775,102.71667
+PAK,Paksane,012703,Mekong,Lao PDR,18.373404,103.66321
+NAK,Nakhon Phanom,013101,Mekong,Thailand,17.623796,104.51742
+THA,Thakhek,013102,Mekong,Lao PDR,17.394533,104.8014
+SAV,Savannakhet,013401,Mekong,Lao PDR,16.563604,105.74297
+MUK,Mukdahan,013402,Mekong,Thailand,16.5828,104.73318
+PKS,Pakse,013901,Mekong,Lao PDR,15.09976,105.81319
+KHO,Khong Chiam,013801,Mekong,Thailand,15.32209,105.49348
+STR,Stung Treng,014501,Mekong,Cambodia,13.5325,105.95019
+KRA,Kratie,014901,Mekong,Cambodia,12.48141,106.01762
+KOM,Kompong Cham,019802,Mekong,Cambodia,11.994647,105.46873
+NEA,Neak Luong,019806,Mekong,Cambodia,11.263037,105.28012
+PPP,Phnom Penh Port,,Mekong,Cambodia,11.5586,104.9172
+PPB,Phnom Penh (Bassac),,Bassac,Cambodia,11.55,104.933
+KOH,Koh Khel,033402,Bassac,Cambodia,11.242035,105.036156
+PRE,Prek Kdam,020102,Tonlesap,Cambodia,11.81117,104.80678
+TCH,Tan Chau,019803,Mekong,Viet Nam,10.80062,105.24802
+CDO,Chau Doc,039801,Bassac,Viet Nam,10.70528,105.13351

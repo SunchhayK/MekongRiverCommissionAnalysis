@@ -1,0 +1,5 @@
+id,name_en,name_kh,river,lat,lng,alarm_stage_m,flood_stage_m,zero_gauge_elevation_m,fallback_id
+019802,Kompong Cham,កំពង់ចាម,Mekong,11.994647,105.46873,15.2,16.2,,033401
+020102,Prek Kdam,,Tonlesap,11.81117,104.80678,9.5,10.0,0.08,033401
+033401,Chaktomuk,ចតុមុខ,Bassac,11.563,104.9353,10.5,12.0,-1.02,033402
+033402,Koh Khel,,Bassac,11.242035,105.036156,7.9,8.4,-1.0,033401
