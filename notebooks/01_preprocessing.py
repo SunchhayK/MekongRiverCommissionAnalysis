@@ -230,7 +230,7 @@ cm_by_station
 
 # %%
 # join station names + datums for the exposure table
-st = live_st[["id", "station", "name_en", "alarm_stage_m", "flood_stage_m", "zero_gauge_elevation_m"]]
+st = live_st[["id", "station", "alarm_stage_m", "flood_stage_m", "zero_gauge_elevation_m"]]
 cm_exp = cm.merge(st, left_on="nearest_station_id", right_on="id", how="left")
 cm_exp.to_parquet(OUT / "communes_clean.parquet", index=False)
 cm_exp[cm_exp.station.notna()].groupby("station").agg(

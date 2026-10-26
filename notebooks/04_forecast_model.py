@@ -52,6 +52,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.linear_model import RidgeClassifier
 
 from mekongds import data
+from mekongds.forecast import build_features
 from mekongds.metrics import mae, rmse, nse, kge, skill, brier, brier_skill, interval_coverage, pinball
 from mekongds.plotting import set_style, savefig, STAGE_COLORS, PALETTE
 
@@ -79,37 +80,8 @@ rel_mask &= ~((w.index >= "2014-06-01") & (w.index <= "2014-10-31"))
 # ## 1. Feature engineering
 
 # %%
-OWN_LAGS = {"KOM": [0, 1, 2, 3, 4, 5, 6], "PRE": [0, 1, 2, 3, 5, 7, 14], "KOH": [0, 1, 2, 3, 5, 7, 14]}
-ROLLS = {"KOM": [3, 7, 15], "PRE": [3, 7, 15, 30], "KOH": [3, 7, 15, 30]}
-RISES = [1, 3]
-# upstream stations and the lags (days back from issue time) that EDA says carry signal
-UP = {
-    "KOM": {"KRA": [0, 1, 2], "STR": [1, 2, 3], "PKS": [3, 4, 5], "KHO": [3, 4, 5],
-            "MUK": [4, 5, 6], "SAV": [4, 5, 6], "NAK": [5, 6, 7], "PAK": [6, 7, 8]},
-    "PRE": {"KOM": [0, 5, 10, 15], "KOH": [0, 1, 2], "PPP": [0, 1, 2], "KRA": [0, 1, 2], "NEA": [0, 1, 2]},
-    "KOH": {"PPP": [0, 1, 2], "PPB": [0, 1, 2], "KOM": [0, 1, 2], "NEA": [0, 1, 2], "PRE": [0, 1, 2]},
-}
-
-def build_features(station: str, include_upstream: bool = True) -> pd.DataFrame:
-    s = w[station]
-    cols = {}
-    for lag in OWN_LAGS[station]:
-        cols[f"{station}_lag{lag}"] = s.shift(lag)
-    for win in ROLLS[station]:
-        cols[f"{station}_mean{win}"] = s.rolling(win).mean()
-    for r in RISES:
-        cols[f"{station}_rise{r}"] = s - s.shift(r)
-    if include_upstream:
-        for up, lags in UP[station].items():
-            for lag in lags:
-                cols[f"{up}_lag{lag}"] = w[up].shift(lag)
-    doy = w.index.dayofyear.values
-    for k in (1, 2, 3):
-        cols[f"sin{k}"] = np.sin(2 * np.pi * k * doy / 365.25)
-        cols[f"cos{k}"] = np.cos(2 * np.pi * k * doy / 365.25)
-    return pd.DataFrame(cols, index=w.index)
-
-FEATS = {stn: build_features(stn) for stn in TARGETS}
+# feature spec lives in mekongds.forecast so training and inference share it
+FEATS = {stn: build_features(w, stn) for stn in TARGETS}
 
 # evaluation rows: wet season, reliable era, target and today's stage observed
 def eval_rows(station: str, lead: int) -> pd.Series:
@@ -129,7 +101,7 @@ f"{len(FEATS['KOM'].columns)} features for KOM; wet rows 2007–2025: {int(eval_
 def make_lgbm(**kw):
     return lgb.LGBMRegressor(
         n_estimators=500, learning_rate=0.04, num_leaves=31, min_child_samples=25,
-        subsample=0.9, subsample_freq=1, colsample_bytree=0.9, random_state=7, **kw,
+        subsample=0.9, subsample_freq=1, colsample_bytree=0.9, random_state=7, verbose=-1, **kw,
     )
 
 def fit_predict_fold(station: str, lead: int, test_year: int) -> dict:
@@ -186,26 +158,180 @@ def fit_predict_fold(station: str, lead: int, test_year: int) -> dict:
     return out, Xtr, ytr, Xte, yte
 
 # %% [markdown]
-# ## 3. Point-forecast CV
+# ## 3. Cross-validation: one pass, cached
+#
+# Each fold is trained once and cached; all sections below read the cache.
+# Per fold: point forecasts (persistence/climatology/ridge/LightGBM), 90%
+# quantile interval, residual-CDF exceedance probabilities at the relevant
+# thresholds, and a classifier comparison at KOM.
 
 # %%
-rows = []
-for stn in TARGETS:
-    for lead in LEADS:
-        for ty in TEST_YEARS:
-            fold, *_ = fit_predict_fold(stn, lead, ty)
-            y = fold["y"]
-            for model in ["persistence", "climatology", "ridge", "lgbm"]:
-                yhat = fold[model]
-                rows.append({
-                    "station": stn, "lead": lead, "test_year": ty, "model": model,
-                    "n": len(y),
-                    "MAE": mae(y, yhat), "RMSE": rmse(y, yhat),
-                    "NSE": nse(y, yhat), "KGE": kge(y, yhat),
-                    "skill_vs_pers": skill(y, yhat, fold["persistence"]),
+from functools import lru_cache
+
+
+def exceed_thresholds(station: str, train_mask: pd.Series) -> dict[str, float]:
+    """Alarm stage where the record crosses it; else the training wet-season p95."""
+    if station == "KOM":
+        return {"alarm": float(TH.loc["KOM", "alarmStage"])}
+    wet_vals = w.loc[train_mask, station].dropna()
+    wet_vals = wet_vals[wet_vals.index.month.isin(WET_MONTHS)]
+    return {"p95": float(wet_vals.quantile(0.95))}
+
+@lru_cache(maxsize=None)
+def cached_fold(station: str, lead: int, test_year: int):
+    return fit_predict_fold(station, lead, test_year)
+
+# Cache guard: the CV loop takes ~25 min on CPU. If complete results from a
+# previous run exist, load them; otherwise compute and save. The downstream
+# cells (figures, tables, §6–§9 examples) still need one live fold for the
+# 2019 hydrograph, so cached_fold stays defined either way.
+_expected_rows = len(TARGETS) * len(LEADS) * len(TEST_YEARS) * 4  # 4 models
+_cache_ok = False
+try:
+    _cv_cache = pd.read_parquet(OUT / "cv_point.parquet")
+    _q_cache = pd.read_parquet(OUT / "cv_quantile.parquet")
+    _e_cache = pd.read_parquet(OUT / "cv_exceed.parquet")
+    _cache_ok = (
+        len(_cv_cache) >= _expected_rows
+        and "coverage90_conformal" in _q_cache.columns
+        and set(_cv_cache.station.unique()) >= set(TARGETS)
+    )
+except Exception:
+    _cache_ok = False
+
+if _cache_ok:
+    cv_point, cv_q, cv_exc = _cv_cache, _q_cache, _e_cache
+    # rel_df and clf_cmp are small; rebuild from cached folds once, then persist
+    _rel_path = OUT / "cv_reliability.parquet"
+    _clf_path = OUT / "cv_classifier.parquet"
+    if _rel_path.exists():
+        rel_df = pd.read_parquet(_rel_path)
+    else:
+        reliability_frames = []
+        for lead in (1, 3, 5, 7, 10):
+            for ty in TEST_YEARS:
+                fold, *_ = cached_fold("KOM", lead, ty)
+                if "_resid_q" not in fold:
+                    continue
+                thr = float(TH.loc["KOM", "alarmStage"])
+                p = 1 - np.interp(thr - fold["lgbm"], fold["_resid_q"], fold["_resid_probs"])
+                e = (fold["y"] > thr).astype(float)
+                reliability_frames.append(pd.DataFrame({"p": p, "e": e, "lead": lead, "year": ty}))
+        rel_df = pd.concat(reliability_frames, ignore_index=True)
+        rel_df.to_parquet(_rel_path)
+    if _clf_path.exists():
+        clf_cmp = pd.read_parquet(_clf_path)
+    else:
+        clf_rows = []
+        for lead in (1, 3, 5, 7, 10):
+            for ty in TEST_YEARS:
+                fold, Xtr, ytr, Xte, yte = cached_fold("KOM", lead, ty)
+                if "_resid_q" not in fold:
+                    continue
+                thr = float(TH.loc["KOM", "alarmStage"])
+                etr, ete = (ytr > thr).astype(int), (yte > thr).astype(int)
+                clf = lgb.LGBMClassifier(
+                    n_estimators=500, learning_rate=0.04, num_leaves=31, min_child_samples=25,
+                    subsample=0.9, subsample_freq=1, colsample_bytree=0.9, verbose=-1,
+                    scale_pos_weight=max(1.0, (1 - etr.mean()) / max(etr.mean(), 1e-6)),
+                    random_state=7,
+                ).fit(Xtr, etr)
+                pclf = clf.predict_proba(Xte)[:, 1]
+                pres = 1 - np.interp(thr - fold["lgbm"], fold["_resid_q"], fold["_resid_probs"])
+                clf_rows.append({
+                    "lead": lead, "test_year": ty, "n_events": int(ete.sum()),
+                    "classifier_PR_AUC": average_precision_score(ete, pclf) if ete.any() else np.nan,
+                    "residCDF_PR_AUC": average_precision_score(ete, pres) if ete.any() else np.nan,
+                    "classifier_Brier": brier(ete, pclf),
+                    "residCDF_Brier": brier(ete, pres),
                 })
-cv_point = pd.DataFrame(rows)
-cv_point.to_parquet(OUT / "cv_point.parquet")
+        clf_cmp = pd.DataFrame(clf_rows)
+        clf_cmp.to_parquet(_clf_path)
+    print(f"loaded cached CV results ({len(cv_point)} rows); skipped the {len(TEST_YEARS) * len(LEADS) * len(TARGETS)}-fold refit")
+else:
+    rows = []
+    q_rows = []
+    exc_rows = []
+    reliability_frames = []
+    clf_rows = []
+
+    for stn in TARGETS:
+        for lead in LEADS:
+            for ty in TEST_YEARS:
+                fold, Xtr, ytr, Xte, yte = cached_fold(stn, lead, ty)
+                y = fold["y"]
+                for model in ["persistence", "climatology", "ridge", "lgbm"]:
+                    yhat = fold[model]
+                    rows.append({
+                        "station": stn, "lead": lead, "test_year": ty, "model": model,
+                        "n": len(y),
+                        "MAE": mae(y, yhat), "RMSE": rmse(y, yhat),
+                        "NSE": nse(y, yhat), "KGE": kge(y, yhat),
+                        "skill_vs_pers": skill(y, yhat, fold["persistence"]),
+                    })
+                q_rows.append({
+                    "station": stn, "lead": lead, "test_year": ty,
+                    "coverage90": interval_coverage(y, fold["q05"], fold["q95"]),
+                    "width": float(np.mean(fold["q95"] - fold["q05"])),
+                    "pinball05": pinball(y, fold["q05"], 0.05),
+                    "pinball95": pinball(y, fold["q95"], 0.95),
+                })
+                if "_resid_q" in fold:
+                    lo_c = fold["lgbm"] + np.interp(0.05, fold["_resid_probs"], fold["_resid_q"])
+                    hi_c = fold["lgbm"] + np.interp(0.95, fold["_resid_probs"], fold["_resid_q"])
+                    q_rows[-1].update({
+                        "coverage90_conformal": interval_coverage(y, lo_c, hi_c),
+                        "width_conformal": float(np.mean(hi_c - lo_c)),
+                    })
+                if "_resid_q" not in fold:
+                    continue
+                thr_map = exceed_thresholds(stn, fold["_train_mask"])
+                tr_y = fold["_ytr"].values
+                for tname, thr in thr_map.items():
+                    p = 1 - np.interp(thr - fold["lgbm"], fold["_resid_q"], fold["_resid_probs"])
+                    e = (y > thr).astype(float)
+                    base = float((tr_y > thr).mean())
+                    exc_rows.append({
+                        "station": stn, "lead": lead, "test_year": ty, "threshold": tname,
+                        "thr": round(thr, 2), "n": len(y), "n_events": int(e.sum()),
+                        "brier": brier(e, p), "brier_clim": brier(e, np.full_like(p, base)),
+                        "bss": brier_skill(e, p, np.full_like(p, base)),
+                    })
+                    if stn == "KOM" and lead in (1, 3, 5, 7, 10):
+                        reliability_frames.append(pd.DataFrame({
+                            "p": p, "e": e, "lead": lead, "year": ty,
+                        }))
+                if stn == "KOM":
+                    thr = float(TH.loc["KOM", "alarmStage"])
+                    etr, ete = (ytr > thr).astype(int), (yte > thr).astype(int)
+                    clf = lgb.LGBMClassifier(
+                        n_estimators=500, learning_rate=0.04, num_leaves=31, min_child_samples=25,
+                        subsample=0.9, subsample_freq=1, colsample_bytree=0.9, verbose=-1,
+                        scale_pos_weight=max(1.0, (1 - etr.mean()) / max(etr.mean(), 1e-6)),
+                        random_state=7,
+                    ).fit(Xtr, etr)
+                    pclf = clf.predict_proba(Xte)[:, 1]
+                    pres = 1 - np.interp(thr - fold["lgbm"], fold["_resid_q"], fold["_resid_probs"])
+                    clf_rows.append({
+                        "lead": lead, "test_year": ty, "n_events": int(ete.sum()),
+                        "classifier_PR_AUC": average_precision_score(ete, pclf) if ete.any() else np.nan,
+                        "residCDF_PR_AUC": average_precision_score(ete, pres) if ete.any() else np.nan,
+                        "classifier_Brier": brier(ete, pclf),
+                        "residCDF_Brier": brier(ete, pres),
+                    })
+
+    cv_point = pd.DataFrame(rows)
+    cv_q = pd.DataFrame(q_rows)
+    cv_exc = pd.DataFrame(exc_rows)
+    clf_cmp = pd.DataFrame(clf_rows)
+    rel_df = pd.concat(reliability_frames, ignore_index=True) if reliability_frames else pd.DataFrame()
+
+    cv_point.to_parquet(OUT / "cv_point.parquet")
+    cv_q.to_parquet(OUT / "cv_quantile.parquet")
+    cv_exc.to_parquet(OUT / "cv_exceed.parquet")
+    rel_df.to_parquet(OUT / "cv_reliability.parquet")
+    clf_cmp.to_parquet(OUT / "cv_classifier.parquet")
+    print(f"folds computed: {len(TEST_YEARS) * len(LEADS) * len(TARGETS)}, rows: {len(cv_point)}")
 
 agg = (cv_point.groupby(["station", "lead", "model"])[["MAE", "RMSE", "NSE", "KGE", "skill_vs_pers"]]
         .mean().round(3).reset_index())
@@ -237,11 +363,13 @@ piv.style.background_gradient(cmap="RdYlGn", vmin=-0.2, vmax=0.6).set_caption(
     "LightGBM skill score vs persistence (1 = perfect, 0 = tie)")
 
 # %% [markdown]
-# LightGBM beats persistence at every lead and station once the lead reaches
-# about 2 days; at 1 day persistence is competitive (as it should be — the
-# river has inertia). The upstream features buy the most at Kratie-fed leads:
-# by day 5–10, persistence is beaten by wide margins at Kompong Cham and
-# Prek Kdam.
+# Reading the table honestly: **ridge beats LightGBM on MAE at every station
+# and lead** — with well-constructed lag features the mapping is close to
+# linear, and the linear model's lower variance wins at this sample size
+# (~2,300 wet-day training rows per fold). LightGBM still beats persistence
+# at every lead (skill 0.14–0.48) and climatology everywhere, and its
+# residual-CDF machinery is what produces calibrated exceedance probabilities,
+# so it stays as the operational model with ridge as the honest benchmark.
 
 # %%
 # headline numbers for the report
@@ -250,27 +378,23 @@ head = (agg[agg.model == "lgbm"]
 head
 
 # %% [markdown]
-# ## 4. Quantile forecasts: interval coverage and pinball
+# ## 4. Quantile forecasts: interval coverage
+#
+# Two interval constructions on the same folds: direct quantile-LightGBM
+# (0.05/0.95), and a conformal-style interval = point forecast + the 5th/95th
+# percentile of the inner-validation residual distribution.
 
 # %%
-rows = []
-for stn in TARGETS:
-    for lead in LEADS:
-        for ty in TEST_YEARS:
-            fold, *_ = fit_predict_fold(stn, lead, ty)
-            y, lo, hi = fold["y"], fold["q05"], fold["q95"]
-            rows.append({
-                "station": stn, "lead": lead, "test_year": ty,
-                "coverage90": interval_coverage(y, lo, hi),
-                "width": float(np.mean(hi - lo)),
-                "pinball05": pinball(y, lo, 0.05),
-                "pinball95": pinball(y, hi, 0.95),
-            })
-cv_q = pd.DataFrame(rows)
-cv_q.to_parquet(OUT / "cv_quantile.parquet")
-(cv_q.groupby(["station", "lead"])[["coverage90", "width"]].mean().round(3)
-   .style.background_gradient(subset="coverage90", cmap="RdYlGn", vmin=0.7, vmax=1.0)
-   .set_caption("90% interval coverage (nominal 0.90) and mean width (m)"))
+(cv_q.groupby(["station", "lead"])[["coverage90", "width", "coverage90_conformal", "width_conformal"]]
+   .mean().round(3))
+
+# %% [markdown]
+# The direct quantile-GBM intervals under-cover (0.52–0.75 against the 0.90
+# nominal), a known failure of quantile boosting in small samples: the pinball
+# loss lets both quantile models drift toward the median. The conformal-style
+# intervals, recalibrated on held-out residual quantiles, land near nominal.
+# The decision layer therefore consumes the residual-CDF, never the raw
+# quantile models.
 
 # %% [markdown]
 # ## 5. Probabilistic exceedance
@@ -284,47 +408,10 @@ cv_q.to_parquet(OUT / "cv_quantile.parquet")
 # Koh Khel, whose alarm stages are never crossed in the record.
 
 # %%
-def exceed_thresholds(station: str, train_mask: pd.Series) -> dict[str, float]:
-    if station == "KOM":
-        return {"alarm": float(TH.loc["KOM", "alarmStage"])}
-    wet_vals = w.loc[train_mask, station].dropna()
-    wet_vals = wet_vals[wet_vals.index.month.isin(WET_MONTHS)]
-    return {"p95": float(wet_vals.quantile(0.95))}
-
-rows = []
-reliability_rows = []
-for stn in TARGETS:
-    for lead in LEADS:
-        for ty in TEST_YEARS:
-            fold, *_ = fit_predict_fold(stn, lead, ty)
-            if "_resid_q" not in fold:
-                continue
-            y = fold["y"]
-            yhat = fold["lgbm"]
-            thr_map = exceed_thresholds(stn, fold["_train_mask"])
-            # climatology base rate for Brier skill, from training years
-            tr_y = fold["_ytr"].values
-            for tname, thr in thr_map.items():
-                p = 1 - np.interp(thr - yhat, fold["_resid_q"], fold["_resid_probs"])
-                e = (y > thr).astype(float)
-                base = float((tr_y > thr).mean())
-                rows.append({
-                    "station": stn, "lead": lead, "test_year": ty, "threshold": tname,
-                    "thr": round(thr, 2), "n": len(y), "n_events": int(e.sum()),
-                    "brier": brier(e, p), "brier_clim": brier(e, np.full_like(p, base)),
-                    "bss": brier_skill(e, p, np.full_like(p, base)),
-                })
-                if stn == "KOM" and lead in (1, 3, 5, 7, 10):
-                    reliability_rows.append(pd.DataFrame({
-                        "p": p, "e": e, "lead": lead, "year": ty,
-                    }))
-cv_exc = pd.DataFrame(rows)
-cv_exc.to_parquet(OUT / "cv_exceed.parquet")
 (cv_exc.groupby(["station", "threshold", "lead"])[["n_events", "brier", "bss"]]
    .mean().round(4).head(20))
 
 # %%
-rel_df = pd.concat(reliability_rows, ignore_index=True)
 bins = [0, 0.05, 0.15, 0.3, 0.6, 1.0]
 rel_df["bin"] = pd.cut(rel_df.p, bins, include_lowest=True)
 rel_tab = rel_df.groupby("bin", observed=True).agg(
@@ -352,29 +439,6 @@ plt.show()
 # residual-CDF probabilities.
 
 # %%
-rows = []
-for lead in [1, 3, 5, 7, 10]:
-    for ty in TEST_YEARS:
-        fold, Xtr, ytr, Xte, yte = fit_predict_fold("KOM", lead, ty)
-        thr = float(TH.loc["KOM", "alarmStage"])
-        etr, ete = (ytr > thr).astype(int), (yte > thr).astype(int)
-        clf = lgb.LGBMClassifier(
-            n_estimators=500, learning_rate=0.04, num_leaves=31, min_child_samples=25,
-            subsample=0.9, subsample_freq=1, colsample_bytree=0.9,
-            scale_pos_weight=max(1.0, (1 - etr.mean()) / max(etr.mean(), 1e-6)),
-            random_state=7,
-        ).fit(Xtr, etr)
-        pclf = clf.predict_proba(Xte)[:, 1]
-        if "_resid_q" in fold:
-            pres = 1 - np.interp(thr - fold["lgbm"], fold["_resid_q"], fold["_resid_probs"])
-            rows.append({
-                "lead": lead, "test_year": ty, "n_events": int(ete.sum()),
-                "classifier_PR_AUC": average_precision_score(ete, pclf) if ete.any() else np.nan,
-                "residCDF_PR_AUC": average_precision_score(ete, pres) if ete.any() else np.nan,
-                "classifier_Brier": brier(ete, pclf),
-                "residCDF_Brier": brier(ete, pres),
-            })
-clf_cmp = pd.DataFrame(rows)
 clf_cmp.groupby("lead")[["classifier_PR_AUC", "residCDF_PR_AUC",
                           "classifier_Brier", "residCDF_Brier"]].mean().round(4)
 
@@ -388,7 +452,7 @@ clf_cmp.groupby("lead")[["classifier_PR_AUC", "residCDF_PR_AUC",
 # ## 7. Ablation: how much do upstream stations buy?
 
 # %%
-FEATS_NOUP = {stn: build_features(stn, include_upstream=False) for stn in ["KOM"]}
+FEATS_NOUP = {stn: build_features(w, stn, include_upstream=False) for stn in ["KOM"]}
 
 rows = []
 for lead in LEADS:
@@ -421,7 +485,7 @@ plt.show()
 # ## 8. Example: the 2019 flood at Kompong Cham, lead 3
 
 # %%
-fold, *_ = fit_predict_fold("KOM", 3, 2019)
+fold, *_ = cached_fold("KOM", 3, 2019)
 seg = pd.DataFrame({"y": fold["y"], "fc": fold["lgbm"], "lo": fold["q05"], "hi": fold["q95"]},
                    index=fold["date"]).loc["2019-08-15":"2019-11-15"]
 fig, ax = plt.subplots(figsize=(10, 4))
@@ -454,9 +518,10 @@ plt.show()
 # ## 10. Final models for the decision layer
 #
 # Refit point + quantile models on all reliable-era wet seasons (2007–2025)
-# and save with the feature spec. Notebook 05 issues forecasts from the
-# 2026-10-20 state of the network.
-
+# and save with the feature spec. Only what notebook 05 consults is kept:
+# PRE and KOH (the stations with published gauge datums — KOM has none, so no
+# commune trigger can use it), at leads 3, 5, 7 (ACT, sensitivity, prepare
+# windows). Lead 1 is persistence territory; lead 10 is beyond farm action.
 # %%
 for stn in TARGETS:
     X = FEATS[stn]
